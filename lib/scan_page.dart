@@ -8,6 +8,12 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 
+import 'ai_vision.dart';
+
+// API key injected at build time via --dart-define=OPENAI_API_KEY=sk-...
+// Empty string disables the AI path and falls back to ML Kit OCR.
+const String _openAiKey = String.fromEnvironment('OPENAI_API_KEY', defaultValue: '');
+
 class ScanResult {
   final List<double> prices;
   final String? detectedName;
@@ -116,9 +122,25 @@ class _ScanPageState extends State<ScanPage> {
     try {
       final shot = await ctrl.takePicture();
       final croppedPath = await _cropToGuide(shot.path);
-      final input = InputImage.fromFilePath(croppedPath ?? shot.path);
-      final recognized = await recognizer.processImage(input);
-      final result = _parse(recognized);
+      final imagePath = croppedPath ?? shot.path;
+
+      ScanResult? result;
+      if (_openAiKey.isNotEmpty) {
+        final ai = await parseLabelWithAI(File(imagePath), _openAiKey);
+        if (ai != null && (ai.prices.isNotEmpty || ai.name != null)) {
+          result = ScanResult(
+            prices: ai.prices,
+            detectedName: ai.name,
+            rawText: ai.rawText,
+          );
+        }
+      }
+      if (result == null) {
+        final input = InputImage.fromFilePath(imagePath);
+        final recognized = await recognizer.processImage(input);
+        result = _parse(recognized);
+      }
+
       if (!mounted) return;
       Navigator.of(context).pop(result);
     } catch (e) {
