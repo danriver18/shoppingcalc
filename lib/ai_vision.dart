@@ -18,7 +18,11 @@ Return ONLY a valid JSON object, with this exact shape and keys:
 {"name": "string", "price": 0.0, "alternatives": [0.0]}
 
 Rules:
-- "name": the product/brand text as the shopper would say it. Keep accents. Trim leading/trailing whitespace. Drop generic noise like "Precios Cuidados", "Oferta", "Promo", "Antes/Ahora", barcodes, weights, codes, dates. Empty string if you really cannot tell.
+- "name": the best product/brand text visible on the label, as the shopper would say it. Keep accents. Trim leading/trailing whitespace.
+- Do NOT leave "name" empty if any product, brand, variant, flavor, size, or category text is visible. Return your best useful name even when part of it is partially readable.
+- If product text is split across lines, combine the meaningful parts into one short name.
+- Prefer text visually associated with the headline/current price. Drop generic noise like "Precios Cuidados", "Oferta", "Promo", "Antes/Ahora", barcodes, weights, codes, dates, SKU, store labels, and legal text.
+- Use empty string only when there is no usable product/brand/category text at all.
 - "price": the headline price the customer pays TODAY (the biggest, most prominent number on the label, usually the "AHORA" or sale price). Plain decimal number — never a string, never include "\$".
 - "alternatives": every OTHER price visible on the label (regular/old price, per-kilo, per-unit, club price, etc), each as a plain decimal number. Empty array if there is only one price.
 - Argentine number format: "." is thousands, "," is decimal. "\$1.234,56" => 1234.56. "\$ 23,⁹⁰" (superscript cents) => 23.90.

@@ -986,10 +986,10 @@ class _AddItemSheetState extends State<_AddItemSheet> {
     });
 
     final msg = result.prices.isEmpty
-        ? 'No se detectó ningún precio, ingresalo manual'
+        ? result.priceDetectionNote ?? 'No se detectó ningún precio, ingresalo manual'
         : result.prices.length == 1
-            ? 'Precio detectado'
-            : 'Se detectaron ${result.prices.length} precios, elegí el correcto';
+            ? 'Precio detectado por IA'
+            : 'La IA detectó ${result.prices.length} precios, elegí el correcto';
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text(msg), duration: const Duration(seconds: 2)),
     );

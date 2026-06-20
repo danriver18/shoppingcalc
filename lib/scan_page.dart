@@ -2,7 +2,6 @@ import 'dart:io';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
-import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import 'package:image/image.dart' as img;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
@@ -10,15 +9,30 @@ import 'package:permission_handler/permission_handler.dart';
 
 import 'ai_vision.dart';
 
-// API key injected at build time via --dart-define=OPENAI_API_KEY=sk-...
-// Empty string disables the AI path and falls back to ML Kit OCR.
-const String _openAiKey = String.fromEnvironment('OPENAI_API_KEY', defaultValue: '');
+// Build-time key still wins, but this personal build has a local fallback so
+// price detection works without passing --dart-define every time.
+const String _localOpenAiKey =
+    'sk-proj-0ZlmoQ1kwz3fVm8cYq6SoOlM6-'
+    'CnieUEsApjt2TFOs9PFIOGKug37xSjzpdjt9H0rKeozrL49'
+    'DT3BlbkFJzit6AuGm1J0nsxwCljMUDG9kYATr2X2IGPb2'
+    'zdGK2KM8vn51zSDIEvilFBdfCOJeRQwkUkyS0A';
+const String _openAiKey = String.fromEnvironment(
+  'OPENAI_API_KEY',
+  defaultValue: _localOpenAiKey,
+);
 
 class ScanResult {
   final List<double> prices;
   final String? detectedName;
   final String rawText;
-  ScanResult({required this.prices, required this.detectedName, required this.rawText});
+  final String? priceDetectionNote;
+
+  ScanResult({
+    required this.prices,
+    required this.detectedName,
+    required this.rawText,
+    this.priceDetectionNote,
+  });
 }
 
 // Guide frame relative to preview. Keep in sync between overlay + crop logic.
@@ -118,28 +132,30 @@ class _ScanPageState extends State<ScanPage> {
     final ctrl = _controller;
     if (ctrl == null || _processing) return;
     setState(() => _processing = true);
-    final recognizer = TextRecognizer(script: TextRecognitionScript.latin);
     try {
       final shot = await ctrl.takePicture();
       final croppedPath = await _cropToGuide(shot.path);
       final imagePath = croppedPath ?? shot.path;
 
-      ScanResult? result;
+      AiVisionResult? ai;
+      String? priceDetectionNote;
       if (_openAiKey.isNotEmpty) {
-        final ai = await parseLabelWithAI(File(imagePath), _openAiKey);
-        if (ai != null && (ai.prices.isNotEmpty || ai.name != null)) {
-          result = ScanResult(
-            prices: ai.prices,
-            detectedName: ai.name,
-            rawText: ai.rawText,
-          );
+        ai = await parseLabelWithAI(File(imagePath), _openAiKey);
+        if (ai == null) {
+          priceDetectionNote = 'La IA no respondió; ingresá el precio manualmente';
+        } else if (ai.prices.isEmpty) {
+          priceDetectionNote = 'La IA no detectó precios; ingresalo manual';
         }
+      } else {
+        priceDetectionNote = 'IA de precios no configurada; ingresá el precio manualmente';
       }
-      if (result == null) {
-        final input = InputImage.fromFilePath(imagePath);
-        final recognized = await recognizer.processImage(input);
-        result = _parse(recognized);
-      }
+
+      final result = ScanResult(
+        prices: ai?.prices ?? const <double>[],
+        detectedName: ai?.name,
+        rawText: ai?.rawText ?? '',
+        priceDetectionNote: priceDetectionNote,
+      );
 
       if (!mounted) return;
       Navigator.of(context).pop(result);
@@ -149,8 +165,6 @@ class _ScanPageState extends State<ScanPage> {
         _processing = false;
         _error = 'Error al procesar: $e';
       });
-    } finally {
-      await recognizer.close();
     }
   }
 
@@ -176,213 +190,6 @@ class _ScanPageState extends State<ScanPage> {
     } catch (_) {
       return null;
     }
-  }
-
-  ScanResult _parse(RecognizedText recognized) {
-    // Strict: prices explicitly prefixed with "$". Group 2 catches superscript
-    // cents that OCR often splits onto a separate line (e.g. "$ 23,⁹⁰").
-    final dollarPrice = RegExp(r'\$\s*(\d[\d.,]*\d|\d)(?:[,\s]{1,3}(\d{2}))?');
-    // Loose: any number with thousands/decimal separators, even without "$",
-    // for labels where OCR drops the dollar sign. Plain integers (barcodes,
-    // dates, codes) are excluded because they need at least one separator.
-    final loosePrice = RegExp(
-      r'(?:^|[^\d.,])(\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?|\d{1,6}[.,]\d{1,2})(?:[^\d.,]|$)',
-    );
-    // Track each detected price with the maximum line height seen for it —
-    // taller line = bigger font = more likely to be the headline price.
-    final priceHeights = <double, double>{};
-    final nameCandidates = <_NameCandidate>[];
-    final digitsOnly = RegExp(r'^[\d.,\s]+$');
-
-    void notePrice(double? v, double h) {
-      if (v == null || v <= 0 || v >= 1e9) return;
-      final prev = priceHeights[v] ?? 0;
-      if (h > prev) priceHeights[v] = h;
-    }
-
-    for (final block in recognized.blocks) {
-      final blockMaxH = block.lines.isEmpty
-          ? 0.0
-          : block.lines
-              .map((l) => l.boundingBox.height.toDouble())
-              .reduce((a, b) => a > b ? a : b);
-      final blockNormalized = _normalizeOcrDigits(block.text);
-      for (final line in block.lines) {
-        final text = line.text.trim();
-        if (text.isEmpty) continue;
-        final h = line.boundingBox.height.toDouble();
-        final normalized = _normalizeOcrDigits(text);
-        bool hadPrice = false;
-        for (final m in dollarPrice.allMatches(normalized)) {
-          notePrice(_parsePrice(m.group(1)!, cents: m.group(2)), h);
-          hadPrice = true;
-        }
-        for (final m in loosePrice.allMatches(normalized)) {
-          notePrice(_parsePrice(m.group(1)!), h);
-          hadPrice = true;
-        }
-        if (!hadPrice && !digitsOnly.hasMatch(text)) {
-          nameCandidates.add(_NameCandidate(text, h));
-        }
-      }
-      // Block-level matches catch prices split across lines (superscript cents).
-      for (final m in dollarPrice.allMatches(blockNormalized)) {
-        notePrice(_parsePrice(m.group(1)!, cents: m.group(2)), blockMaxH);
-      }
-      for (final m in loosePrice.allMatches(blockNormalized)) {
-        notePrice(_parsePrice(m.group(1)!), blockMaxH);
-      }
-    }
-    // Cross-block fallback (uses height 0 so these rank last).
-    final recognizedNormalized = _normalizeOcrDigits(recognized.text);
-    for (final m in dollarPrice.allMatches(recognizedNormalized)) {
-      notePrice(_parsePrice(m.group(1)!, cents: m.group(2)), 0);
-    }
-
-    // Supermarket "superscript cents" recovery: when the integer part (like
-    // "23,") and the 2-digit cents ("90") end up on distant lines due to
-    // visual noise, pair them up and expose every combination as a chip.
-    final orphanInts = <(int, double)>[];
-    final orphanCents = <(String, double)>[];
-    final intCommaLine = RegExp(r'^\$?\s*(\d{1,6}),\s*$');
-    final centsLine = RegExp(r'^(\d{2})$');
-    for (final block in recognized.blocks) {
-      for (final line in block.lines) {
-        final t = _normalizeOcrDigits(line.text.trim());
-        final h = line.boundingBox.height.toDouble();
-        final im = intCommaLine.firstMatch(t);
-        final cm = centsLine.firstMatch(t);
-        if (im != null) {
-          orphanInts.add((int.parse(im.group(1)!), h));
-        } else if (cm != null) {
-          orphanCents.add((cm.group(1)!, h));
-        }
-      }
-    }
-    for (final (iv, ih) in orphanInts) {
-      for (final (cs, ch) in orphanCents) {
-        final combined = double.tryParse('$iv.$cs');
-        if (combined != null && combined > 0) {
-          notePrice(combined, ih > ch ? ih : ch);
-        }
-      }
-    }
-
-    // Sort prices by visual prominence (tallest first), tie-break by value desc.
-    final sorted = priceHeights.entries.toList()
-      ..sort((a, b) {
-        final c = b.value.compareTo(a.value);
-        if (c != 0) return c;
-        return b.key.compareTo(a.key);
-      });
-    final prices = sorted.map((e) => e.key).toList();
-    final name = _guessName(nameCandidates);
-    return ScanResult(prices: prices, detectedName: name, rawText: recognized.text);
-  }
-
-  // Fix common OCR confusions when a letter appears adjacent to digits:
-  // O/o/D/Q → 0, I/l/| → 1, S → 5, B → 8. Applies only next to other
-  // digits so we don't mangle regular words.
-  String _normalizeOcrDigits(String s) {
-    return s
-        .replaceAllMapped(
-          RegExp(r'(?<=\d)[OoDQ]|[OoDQ](?=\d)'),
-          (_) => '0',
-        )
-        .replaceAllMapped(
-          RegExp(r'(?<=\d)[Il|]|[Il|](?=\d)'),
-          (_) => '1',
-        )
-        .replaceAllMapped(
-          RegExp(r'(?<=\d)[Ss]|[Ss](?=\d)'),
-          (_) => '5',
-        )
-        .replaceAllMapped(
-          RegExp(r'(?<=\d)B|B(?=\d)'),
-          (_) => '8',
-        );
-  }
-
-  // Parses a price string like "2.69", "1.234,50", "1,234.56", "1.600.900",
-  // "16.090,0" — auto-detects AR (., decimal=,) vs US (,, decimal=.) locale.
-  // If [cents] is provided (from superscript capture), uses it directly.
-  double? _parsePrice(String raw, {String? cents}) {
-    if (cents != null && cents.isNotEmpty) {
-      final clean = raw.replaceAll(RegExp(r'[.,\s]'), '');
-      if (clean.isEmpty) return null;
-      return double.tryParse('$clean.$cents');
-    }
-    final dotIdx = raw.lastIndexOf('.');
-    final commaIdx = raw.lastIndexOf(',');
-    String intStr;
-    String decStr = '0';
-
-    if (dotIdx < 0 && commaIdx < 0) {
-      intStr = raw;
-    } else if (dotIdx >= 0 && commaIdx >= 0) {
-      // Both separators present: the rightmost one is the decimal.
-      if (dotIdx > commaIdx) {
-        intStr = raw.substring(0, dotIdx).replaceAll(',', '');
-        decStr = raw.substring(dotIdx + 1);
-      } else {
-        intStr = raw.substring(0, commaIdx).replaceAll('.', '');
-        decStr = raw.substring(commaIdx + 1);
-      }
-    } else {
-      final sep = dotIdx >= 0 ? '.' : ',';
-      final lastIdx = dotIdx >= 0 ? dotIdx : commaIdx;
-      final count = sep.allMatches(raw).length;
-      final afterLast = raw.substring(lastIdx + 1);
-      if (count > 1 || afterLast.length == 3) {
-        // Multiple occurrences or 3 trailing digits → thousands separator.
-        intStr = raw.replaceAll(sep, '');
-      } else {
-        // Single separator with 1–2 trailing digits → decimal.
-        intStr = raw.substring(0, lastIdx);
-        decStr = afterLast;
-      }
-    }
-
-    intStr = intStr.replaceAll(RegExp(r'\D'), '');
-    decStr = decStr.replaceAll(RegExp(r'\D'), '');
-    if (intStr.isEmpty) return null;
-    if (decStr.isEmpty) decStr = '0';
-    return double.tryParse('$intStr.$decStr');
-  }
-
-  String? _guessName(List<_NameCandidate> candidates) {
-    final noise = RegExp(
-      r'^(oferta|promo|promoción|promocion|precio|precios|descuento|descto|desc\.?|dcto\.?|dto\.?|lleva|pague|antes|ahora|hoy|nuevo|nueva|ref\w*|cod\.?|código|codigo|lpp|rnpd|sku|gratis|origen|scanning|scan\b|peso\s+neto|solo\s|familiar|cuidados|x\s*\d|\d+\s*x|\d+%)',
-      caseSensitive: false,
-    );
-    final repeatedPattern = RegExp(r'(.{2})\1{2,}');
-    final letterRegex = RegExp(r'[A-Za-zÁÉÍÓÚÑáéíóúñ]');
-    bool dominatedByOneChar(String s) {
-      final letters = s.replaceAll(RegExp(r'\s'), '').toUpperCase();
-      if (letters.length < 4) return false;
-      final counts = <String, int>{};
-      for (final ch in letters.split('')) {
-        counts[ch] = (counts[ch] ?? 0) + 1;
-      }
-      final maxCount = counts.values.reduce((a, b) => a > b ? a : b);
-      return maxCount / letters.length > 0.5;
-    }
-
-    final filtered = candidates
-        .where((c) => c.text.length >= 4)
-        .where((c) => !noise.hasMatch(c.text))
-        .where((c) => !repeatedPattern.hasMatch(c.text))
-        .where((c) => !dominatedByOneChar(c.text))
-        .where((c) => letterRegex.allMatches(c.text).length >= 3)
-        .toList();
-    if (filtered.isEmpty) return null;
-    // Prefer largest font (tallest bounding box); tie-break by length.
-    filtered.sort((a, b) {
-      final cmp = b.height.compareTo(a.height);
-      if (cmp != 0) return cmp;
-      return b.text.length.compareTo(a.text.length);
-    });
-    return filtered.first.text;
   }
 
   @override
@@ -516,12 +323,6 @@ class _ScanPageState extends State<ScanPage> {
       ),
     );
   }
-}
-
-class _NameCandidate {
-  final String text;
-  final double height;
-  _NameCandidate(this.text, this.height);
 }
 
 class _GuideOverlay extends StatelessWidget {
